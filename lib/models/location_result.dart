@@ -14,11 +14,24 @@ class LocationResult {
   final DateTime timestamp;
   final LocationStatus status;
 
+  /// True when [latitude]/[longitude] came from the device's cached
+  /// last-known position rather than a freshly-acquired GPS fix — see
+  /// LocationService's doc comment for why this is preferred as the
+  /// FIRST attempt (it returns near-instantly, unlike a live fix which
+  /// can take 10+ seconds indoors). Always false when [status] is not
+  /// success. Callers that build a user-facing message (e.g.
+  /// EmergencyAlertDispatcher) should surface this, since an
+  /// approximate/stale location is still far more useful to a
+  /// responder than none, but shouldn't be presented as if it were the
+  /// victim's exact current position.
+  final bool isApproximate;
+
   const LocationResult({
     required this.latitude,
     required this.longitude,
     required this.timestamp,
     required this.status,
+    this.isApproximate = false,
   });
 
   bool get isSuccess => status == LocationStatus.success;
@@ -35,6 +48,7 @@ class LocationResult {
   @override
   String toString() {
     return 'LocationResult(status: $status, latitude: $latitude, '
-        'longitude: $longitude, timestamp: $timestamp)';
+        'longitude: $longitude, isApproximate: $isApproximate, '
+        'timestamp: $timestamp)';
   }
 }

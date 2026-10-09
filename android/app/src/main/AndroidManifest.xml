@@ -11,6 +11,17 @@
     <uses-permission android:name="android.permission.SEND_SMS" />
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
 
+    <!-- Phase 7: foreground service keeping Voice/Behavioral monitoring
+         alive when backgrounded or screen-locked. FOREGROUND_SERVICE is
+         required on API 28+; FOREGROUND_SERVICE_MICROPHONE specifically
+         on API 34+ (Android requires foreground services to declare and
+         hold a permission matching their declared type); POST_NOTIFICATIONS
+         is required on API 33+ to actually display the service's required
+         persistent notification. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
     <application
         android:label="neuralsafe"
         android:name="${applicationName}"
@@ -42,6 +53,12 @@
         <meta-data
             android:name="flutterEmbedding"
             android:value="2" />
+
+        <!-- Phase 7: see MonitoringForegroundService.kt -->
+        <service
+            android:name=".MonitoringForegroundService"
+            android:foregroundServiceType="microphone"
+            android:exported="false" />
     </application>
     <!-- Required to query activities that can process text, see:
          https://developer.android.com/training/package-visibility and

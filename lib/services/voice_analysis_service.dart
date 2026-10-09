@@ -3,6 +3,7 @@ import 'dart:math' as math;
 import 'dart:typed_data';
 
 import 'package:fftea/fftea.dart';
+import 'package:flutter/foundation.dart' show debugPrint, kDebugMode;
 import 'package:flutter/services.dart' show rootBundle;
 import 'package:record/record.dart';
 import 'package:tflite_flutter/tflite_flutter.dart';
@@ -21,6 +22,26 @@ const int kNFreqBins = kNFft ~/ 2 + 1; // 1025
 // so a single loud syllable can't instantly flip the label or spike the
 // score. Dropping back down to a calmer tier is always immediate.
 const int kEscalationConfirmWindows = 2;
+
+/// Which bundled model file the service loads. Retraining produces a new
+/// file (see tools/voice_model/train_voice_model.py); switching to it is
+/// a one-line change here plus listing it under `assets:` in pubspec.yaml.
+const String kVoiceModelAsset = 'assets/ml/neuralsafe_voice_model_v3.tflite';
+
+/// A 1-second window whose RMS amplitude (samples scaled to [-1, 1]) is
+/// below this is treated as silence: the model is skipped and the window
+/// is scored as pure Normal. This matters because the log-Mel features
+/// are peak-normalized PER WINDOW (see MelSpectrogramExtractor.extract),
+/// so a near-silent window is stretched to the same dynamic range as a
+/// loud one and the network cannot tell them apart by volume. ~0.005 is
+/// roughly -46 dBFS, below quiet-room speech on a phone mic. The value
+/// is a starting point — the diagnostic log line printed from
+/// _processWindow shows real RMS values so it can be tuned from data.
+const double kSilenceRmsThreshold = 0.005;
+
+/// In debug builds, print RMS + class probabilities every Nth window
+/// (windows are 500 ms apart, so 4 means one line every 2 seconds).
+const int kDiagnosticLogEveryNWindows = 4;
 
 List<double> _buildHannWindow(int n) {
   return List<double>.generate(
@@ -234,6 +255,7 @@ class VoiceAnalysisService {
   final AudioRecorder _recorder = AudioRecorder();
   StreamSubscription<Uint8List>? _micSubscription;
   final List<int> _int16Buffer = [];
+  int _windowCounter = 0;
   Timer? _windowTimer;
   final VoiceScoringState _state = VoiceScoringState();
   final StreamController<VoiceAnalysisResult> _scoreController =
@@ -255,8 +277,7 @@ class VoiceAnalysisService {
         filterbankData.offsetInBytes, filterbankData.lengthInBytes ~/ 4);
     _extractor = MelSpectrogramExtractor(melFilterbank);
 
-    _interpreter = await Interpreter.fromAsset(
-        'assets/ml/neuralsafe_voice_model_v2.tflite');
+    _interpreter = await Interpreter.fromAsset(kVoiceModelAsset);
 
     _initialized = true;
   }
@@ -301,6 +322,31 @@ class VoiceAnalysisService {
     final floatSamples =
         windowSamples.map((s) => s / 32768.0).toList(growable: false);
 
+    _windowCounter++;
+    var sumSquares = 0.0;
+    for (final s in floatSamples) {
+      sumSquares += s * s;
+    }
+    final rms = math.sqrt(sumSquares / floatSamples.length);
+    final shouldLog =
+        kDebugMode && _windowCounter % kDiagnosticLogEveryNWindows == 0;
+
+    if (rms < kSilenceRmsThreshold) {
+      // Silence gate — see kSilenceRmsThreshold. Still goes through
+      // computeVoiceScore so smoothing/escalation state decays normally.
+      final silentResult =
+          computeVoiceScore(const [1.0, 0.0, 0.0], _state);
+      if (shouldLog) {
+        debugPrint('[NeuralSafe][voice] rms=${rms.toStringAsFixed(4)} '
+            '(silence gate) score=${silentResult.score.toStringAsFixed(1)}');
+      }
+      latest = silentResult;
+      if (!_scoreController.isClosed) {
+        _scoreController.add(silentResult);
+      }
+      return;
+    }
+
     final rawLogMel = _extractor!.extract(floatSamples);
     final normalized = Float32List(rawLogMel.length);
     for (var i = 0; i < rawLogMel.length; i++) {
@@ -322,6 +368,11 @@ class VoiceAnalysisService {
     final probs = (output[0] as List).map((e) => e as double).toList();
 
     final result = computeVoiceScore(probs, _state);
+    if (shouldLog) {
+      debugPrint('[NeuralSafe][voice] rms=${rms.toStringAsFixed(4)} '
+          'probs[N,E,H]=${probs.map((p) => p.toStringAsFixed(2)).toList()} '
+          'class=${result.classification} score=${result.score.toStringAsFixed(1)}');
+    }
     latest = result;
     if (!_scoreController.isClosed) {
       _scoreController.add(result);

@@ -1,3 +1,5 @@
+import 'package:flutter/foundation.dart' show debugPrint;
+
 import '../models/dispatch_result.dart';
 import '../models/location_result.dart';
 import 'alert_cooldown_manager.dart';
@@ -71,6 +73,13 @@ class EmergencyAlertDispatcher {
     }
 
     final location = await _locationService.acquireCurrentLocation();
+    // TEMPORARY debug instrumentation — pinpointing why a real-device
+    // test showed "Location: Unavailable" in the alert SMS. Remove once
+    // the root cause (permission not granted vs. GPS/Location Services
+    // off vs. fix timeout) is confirmed and fixed.
+    debugPrint('[NeuralSafe] Location acquisition result: '
+        'status=${location.status}, lat=${location.latitude}, '
+        'lng=${location.longitude}');
     final message = _buildMessage(location);
 
     final perContactSuccess = <String, bool>{};
@@ -102,7 +111,14 @@ class EmergencyAlertDispatcher {
   }
 
   String _buildMessage(LocationResult location) {
-    final locationPart = location.mapsLink ?? 'Unavailable';
+    var locationPart = location.mapsLink ?? 'Unavailable';
+    // Honest about a last-known (possibly stale) fix vs. a fresh one —
+    // still far more useful to a responder than nothing, but shouldn't
+    // be presented as the victim's exact live position. See
+    // LocationService's doc comment for why this path exists.
+    if (location.isApproximate) {
+      locationPart = '$locationPart (approximate)';
+    }
     return 'EMERGENCY ALERT: NeuralSafe user requires immediate assistance. '
         'Location: $locationPart (Automated alert sent by NeuralSafe)';
   }

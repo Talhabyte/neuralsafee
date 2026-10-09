@@ -1,0 +1,22 @@
+NeuralSafe Behavioral Module — Ensemble Classifier Evaluation
+(synthetic dataset, N=3000 per class, seed=42)
+
+Random Forest accuracy: 0.9344
+Linear SVM accuracy:    0.9511
+Ensemble accuracy:      0.9500
+
+Ensemble classification report:
+                     precision    recall  f1-score   support
+
+             Normal       0.94      0.92      0.93       600
+    MildlyAnomalous       0.92      0.93      0.93       600
+CriticallyAnomalous       0.99      1.00      0.99       600
+
+           accuracy                           0.95      1800
+          macro avg       0.95      0.95      0.95      1800
+       weighted avg       0.95      0.95      0.95      1800
+
+Confusion matrix (rows=true, cols=predicted), order: ['Normal', 'MildlyAnomalous', 'CriticallyAnomalous']
+[[553  47   0]
+ [ 36 557   7]
+ [  0   0 600]]

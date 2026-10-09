@@ -2,16 +2,20 @@ import 'dart:async';
 
 import '../models/anomaly_result_log_entry.dart';
 import '../models/risk_decision.dart';
+import '../models/risk_tier.dart';
 import 'anomaly_evaluator.dart';
 import 'behavioral_anomaly_pipeline.dart';
 import 'danger_score_fusion_engine.dart';
+import 'sustained_danger_tracker.dart';
 
 class RiskDecisionEngine {
   RiskDecisionEngine({
     required Stream<AnomalyResultLogEntry> anomalyStream,
     DangerScoreFusionEngine? fusionEngine,
+    SustainedDangerTracker? sustainedDangerTracker,
   })  : _anomalyStream = anomalyStream,
         _fusionEngine = fusionEngine ?? const DangerScoreFusionEngine(),
+        _sustainedTracker = sustainedDangerTracker ?? SustainedDangerTracker(),
         _controller = StreamController<RiskDecision>.broadcast();
 
   static RiskDecisionEngine? _instance;
@@ -33,6 +37,14 @@ class RiskDecisionEngine {
 
   final Stream<AnomalyResultLogEntry> _anomalyStream;
   final DangerScoreFusionEngine _fusionEngine;
+
+  /// Implements FR-4.2's sustained-danger boost: tracks whether the
+  /// RAW fused score has stayed continuously at/above 60 for 5+
+  /// seconds, and if so, adds +20 before classification — see that
+  /// class's doc comment for why this lives here rather than inside
+  /// DangerScoreFusionEngine itself.
+  final SustainedDangerTracker _sustainedTracker;
+
   final StreamController<RiskDecision> _controller;
 
   StreamSubscription<AnomalyResultLogEntry>? _subscription;
@@ -56,6 +68,9 @@ class RiskDecisionEngine {
   Future<void> stop() async {
     await _subscription?.cancel();
     _subscription = null;
+    // So a later restart's first decision isn't boosted off a
+    // sustained period that happened before this stop.
+    _sustainedTracker.reset();
   }
 
   Future<void> dispose() async {
@@ -87,9 +102,18 @@ class RiskDecisionEngine {
   }
 
   void _handleAnomalyEntry(AnomalyResultLogEntry entry) {
-    _latestBehaviorScore = entry.result.status == AnomalyStatus.evaluated
-        ? entry.result.aggregateScore
-        : null;
+    // Prefer the Random Forest + linear SVM ensemble's continuous
+    // BehaviorScore (NeuralSafe proposal Section 6.3's classification
+    // layer) whenever the classifier produced one for this entry.
+    // Falls back to AnomalyEvaluator's own aggregateScore — the
+    // pre-classifier z-score signal — when classification is
+    // unavailable (classifier asset missing/corrupt) but the z-score
+    // evaluation itself is still evaluated rather than coldStart, so a
+    // classifier failure degrades the signal rather than losing it.
+    _latestBehaviorScore = entry.classification?.behaviorScore ??
+        (entry.result.status == AnomalyStatus.evaluated
+            ? entry.result.aggregateScore
+            : null);
 
     _emitDecision(
       evaluatedAt: entry.evaluatedAt,
@@ -105,9 +129,20 @@ class RiskDecisionEngine {
       'behavior': _latestBehaviorScore,
     });
 
+    // FR-4.2: apply the sustained-danger boost to the RAW fused score,
+    // then classify THAT (not fusionResult's own pre-boost riskTier)
+    // against thresholds that assume the post-boost 0-120 scale. See
+    // SustainedDangerTracker's and RiskThresholds' doc comments.
+    final boostedScore = _sustainedTracker.apply(
+      fusionResult.finalScore,
+      now: evaluatedAt,
+    );
+    final riskTier = classify(boostedScore, thresholds: _fusionEngine.thresholds);
+
     final decision = RiskDecision(
-      riskTier: fusionResult.riskTier,
+      riskTier: riskTier,
       fusionResult: fusionResult,
+      boostedScore: boostedScore,
       evaluatedAt: evaluatedAt,
       windowKey: windowKey,
     );

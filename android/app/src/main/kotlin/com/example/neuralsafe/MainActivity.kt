@@ -19,6 +19,11 @@ class MainActivity : FlutterActivity() {
     // Phase 6: emergency SMS dispatch.
     private val smsGatewayChannelName = "neuralsafe/sms_gateway"
 
+    // Phase 7: foreground service keeping the process (and therefore
+    // Voice's mic stream / Behavioral's Timer) alive when backgrounded
+    // or screen-locked.
+    private val monitoringServiceChannelName = "neuralsafe/monitoring_service"
+
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
 
@@ -80,6 +85,26 @@ class MainActivity : FlutterActivity() {
                         } else {
                             result.success(smsGatewayChannel.sendSms(phoneNumber, message))
                         }
+                    }
+                    else -> result.notImplemented()
+                }
+            }
+
+        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, monitoringServiceChannelName)
+            .setMethodCallHandler { call, result ->
+                when (call.method) {
+                    "start" -> {
+                        val intent = Intent(this, MonitoringForegroundService::class.java)
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                            startForegroundService(intent)
+                        } else {
+                            startService(intent)
+                        }
+                        result.success(null)
+                    }
+                    "stop" -> {
+                        stopService(Intent(this, MonitoringForegroundService::class.java))
+                        result.success(null)
                     }
                     else -> result.notImplemented()
                 }

@@ -1,4 +1,8 @@
+import 'dart:async';
+
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import '../main.dart';
 import '../services/calculator_engine.dart';
 import '../services/secret_code_service.dart';
 import 'dashboard_screen.dart';
@@ -71,13 +75,27 @@ class _CalculatorScreenState extends State<CalculatorScreen> {
         );
         return;
       case CodeAction.silentDecoyAlarm:
-        // Phase 6/7 will wire this into the real Danger Score fusion
-        // engine + AlertResponseManager. For now it just resets the
-        // display like nothing happened, which is the whole point.
+        // Resets the display like nothing happened — the whole point
+        // of the decoy code — while a real (dry-run by default; see
+        // main.dart's emergencyOrchestrator construction) alert
+        // dispatch runs in the background through the exact same
+        // EmergencyAlertDispatcher + AlertCooldownManager a genuine
+        // highDanger transition would use. Fire-and-forget from the
+        // UI's perspective: never awaited, so there is no delay and
+        // no risk of this screen visibly hanging while location is
+        // acquired or SMS is sent.
         setState(() {
           _input = '';
           _display = '0';
         });
+        unawaited(
+          emergencyOrchestrator.triggerManualAlert().then((result) {
+            debugPrint(
+              '[NeuralSafe] Decoy PIN triggered manual alert dispatch: '
+              '${result.outcome}',
+            );
+          }),
+        );
         return;
       case CodeAction.none:
         break;

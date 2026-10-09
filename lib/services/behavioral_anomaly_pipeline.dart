@@ -4,31 +4,39 @@ import 'package:flutter/foundation.dart';
 
 import '../models/anomaly_result_log_entry.dart';
 import '../models/behavioral_baseline.dart';
+import '../models/behavioral_classification_result.dart';
 import 'anomaly_evaluator.dart';
 import 'anomaly_result_notifier.dart';
 import 'behavioral_baseline_repository.dart';
+import 'behavioral_classifier.dart';
 import 'feature_extractor.dart';
 
 /// Closes the gap BehavioralMonitoringService's own aggregator comment
 /// flags ("nothing acts on the batches yet"): on a fixed period, this
 /// computes a BehavioralFeatureVector over a trailing window ending
 /// now, evaluates it against the persisted running baseline for
-/// [windowKey] via AnomalyEvaluator, records the result via
-/// AnomalyResultNotifier (persist + emit on [anomalyResults]), and
-/// finally updates+persists the baseline with the new sample.
+/// [windowKey] via AnomalyEvaluator, runs the Random Forest + linear
+/// SVM ensemble (BehavioralClassifier) over the resulting z-scores —
+/// the classification layer NeuralSafe proposal Section 6.3 describes
+/// — records both via AnomalyResultNotifier (persist + emit on
+/// [anomalyResults]), and finally updates+persists the baseline with
+/// the new sample.
 ///
 /// Evaluation happens BEFORE the baseline is updated with the new
 /// sample, so a baseline with sampleCount == N is what the (N+1)th
 /// tick evaluates against — the Nth tick is the one that pushes
 /// sampleCount to N. With AnomalyEvaluator's default minSampleCount
 /// of 10, the 11th tick is the first to produce AnomalyStatus.evaluated
-/// rather than coldStart.
+/// rather than coldStart, and therefore the first tick the classifier
+/// runs on (classification stays null during coldStart — there are no
+/// z-scores yet to classify).
 ///
 /// One pipeline instance = one window size/key. Every dependency is
 /// injected as a plain function (not a whole repository object),
 /// matching this codebase's existing pattern (FeatureExtractor's
 /// loadEvents, AnomalyResultNotifier's saveEntry, etc.) so this is
-/// fully unit-testable without touching the encrypted vault.
+/// fully unit-testable without touching the encrypted vault or the
+/// classifier's asset bundle.
 class BehavioralAnomalyPipeline {
   BehavioralAnomalyPipeline._({
     required this.windowKey,
@@ -38,12 +46,17 @@ class BehavioralAnomalyPipeline {
     required Future<void> Function(BehavioralBaseline baseline) saveBaseline,
     required AnomalyEvaluator evaluator,
     required AnomalyResultNotifier notifier,
+    required Future<BehavioralClassificationResult?> Function(
+      Map<String, double> featureZScores,
+    )
+        classify,
     required DateTime Function() clock,
   })  : _featureExtractor = featureExtractor,
         _loadBaseline = loadBaseline,
         _saveBaseline = saveBaseline,
         _evaluator = evaluator,
         _notifier = notifier,
+        _classify = classify,
         _clock = clock;
 
   static BehavioralAnomalyPipeline? _instance;
@@ -60,7 +73,8 @@ class BehavioralAnomalyPipeline {
   static const Duration _defaultWindowSize = Duration(minutes: 2);
 
   /// Application-level singleton, using the real encrypted-vault-backed
-  /// BehavioralBaselineRepository and a real AnomalyResultNotifier.
+  /// BehavioralBaselineRepository, a real AnomalyResultNotifier, and
+  /// the real asset-backed BehavioralClassifier.
   static BehavioralAnomalyPipeline get instance {
     if (_instance != null) return _instance!;
     final repository = BehavioralBaselineRepository();
@@ -70,16 +84,45 @@ class BehavioralAnomalyPipeline {
       featureExtractor: FeatureExtractor(),
       loadBaseline: repository.load,
       saveBaseline: repository.save,
-      evaluator: const AnomalyEvaluator(),
+      // TEMPORARY (revert to const AnomalyEvaluator() — minSampleCount
+      // defaults to 10 — once the Behavioral classifier is confirmed
+      // working on-device): minSampleCount: 2 means the 3rd tick (~6
+      // minutes of monitoring) is already "evaluated" instead of
+      // needing 11 ticks (~22 minutes), so you don't have to sit
+      // through a long wait just to see the classifier run once.
+      evaluator: const AnomalyEvaluator(minSampleCount: 2),
       notifier: AnomalyResultNotifier(),
+      classify: _defaultClassify,
       clock: DateTime.now,
     );
     return _instance!;
   }
 
+  /// Runs the real BehavioralClassifier singleton. Any failure (asset
+  /// missing or corrupt, bad JSON, a malformed vector) degrades
+  /// gracefully to null rather than throwing out of [tick] — a tick
+  /// still records the z-score AnomalyResult either way, and
+  /// RiskDecisionEngine falls back to AnomalyResult.aggregateScore
+  /// whenever classification is null.
+  static Future<BehavioralClassificationResult?> _defaultClassify(
+    Map<String, double> featureZScores,
+  ) async {
+    try {
+      final classifier = await BehavioralClassifier.instance();
+      return classifier.classify(featureZScores);
+    } catch (e) {
+      // TEMPORARY (remove once verified on-device): makes a bad/missing
+      // model asset visible in `flutter run` output instead of silently
+      // falling back to AnomalyResult.aggregateScore.
+      debugPrint('[NeuralSafe] Behavioral classifier failed to run: $e');
+      return null;
+    }
+  }
+
   /// Test-only construction path. Every optional parameter defaults to
-  /// a lightweight in-memory stand-in (no vault, no real clock),
-  /// mirroring BehavioralMonitoringService.test()'s pattern.
+  /// a lightweight in-memory stand-in (no vault, no asset bundle, no
+  /// real clock), mirroring BehavioralMonitoringService.test()'s
+  /// pattern.
   @visibleForTesting
   factory BehavioralAnomalyPipeline.test({
     required String windowKey,
@@ -89,6 +132,10 @@ class BehavioralAnomalyPipeline {
     Future<void> Function(BehavioralBaseline baseline)? saveBaseline,
     AnomalyEvaluator? evaluator,
     AnomalyResultNotifier? notifier,
+    Future<BehavioralClassificationResult?> Function(
+      Map<String, double> featureZScores,
+    )?
+        classify,
     DateTime Function()? clock,
   }) {
     return BehavioralAnomalyPipeline._(
@@ -99,6 +146,7 @@ class BehavioralAnomalyPipeline {
       saveBaseline: saveBaseline ?? (_) async {},
       evaluator: evaluator ?? const AnomalyEvaluator(),
       notifier: notifier ?? AnomalyResultNotifier(),
+      classify: classify ?? (_) async => null,
       clock: clock ?? DateTime.now,
     );
   }
@@ -110,6 +158,9 @@ class BehavioralAnomalyPipeline {
   final Future<void> Function(BehavioralBaseline baseline) _saveBaseline;
   final AnomalyEvaluator _evaluator;
   final AnomalyResultNotifier _notifier;
+  final Future<BehavioralClassificationResult?> Function(
+    Map<String, double> featureZScores,
+  ) _classify;
   final DateTime Function() _clock;
 
   Timer? _timer;
@@ -131,8 +182,8 @@ class BehavioralAnomalyPipeline {
     _timer = null;
   }
 
-  /// Runs a single evaluate-and-update cycle. Exposed publicly (not
-  /// just via the internal Timer) so tests can drive it
+  /// Runs a single evaluate-classify-and-update cycle. Exposed publicly
+  /// (not just via the internal Timer) so tests can drive it
   /// deterministically, and so a manual "evaluate now" trigger is
   /// possible later if wanted (e.g. a demo button).
   Future<void> tick() async {
@@ -144,7 +195,39 @@ class BehavioralAnomalyPipeline {
         _loadBaseline(windowKey) ?? BehavioralBaseline.initial(windowKey);
 
     final result = _evaluator.evaluate(vector, baseline);
-    await _notifier.record(result, windowKey: windowKey);
+
+    final classification = result.status == AnomalyStatus.evaluated
+        ? await _classify(result.featureZScores)
+        : null;
+
+    // TEMPORARY (remove once verified on-device): proves the classifier
+    // actually ran and what it produced, since classification is
+    // otherwise invisible until something reaches highDanger.
+    if (result.status == AnomalyStatus.evaluated) {
+      debugPrint(
+        '[NeuralSafe] Behavioral z-score evaluation: '
+        'aggregateScore=${result.aggregateScore.toStringAsFixed(1)}',
+      );
+      if (classification != null) {
+        debugPrint(
+          '[NeuralSafe] Behavioral classifier: ${classification.predictedClass} '
+          '(behaviorScore=${classification.behaviorScore.toStringAsFixed(1)}, '
+          'probs=${classification.classProbabilities})',
+        );
+      } else {
+        debugPrint(
+          '[NeuralSafe] Behavioral classifier produced no result this tick '
+          '— falling back to aggregateScore (see warning above if the '
+          'asset failed to load).',
+        );
+      }
+    }
+
+    await _notifier.record(
+      result,
+      windowKey: windowKey,
+      classification: classification,
+    );
 
     final updatedBaseline = baseline.updateWith(vector);
     await _saveBaseline(updatedBaseline);

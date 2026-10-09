@@ -10,8 +10,8 @@ dependencies:
   flutter:
     sdk: flutter
   cupertino_icons: ^1.0.6
-  
-  
+
+
   # Phase 2: local encrypted storage
   hive: ^2.2.3
   hive_flutter: ^1.1.0
@@ -44,6 +44,11 @@ flutter:
     - assets/ml/neuralsafe_text_model.tflite
     - assets/ml/sentencepiece.bpe.model
     - assets/ml/neuralsafe_voice_model_v2.tflite
+    - assets/ml/neuralsafe_voice_model_v3.tflite
     - assets/ml/mel_filterbank.bin
     - assets/ml/expected_log_mel.bin
     - assets/ml/test_audio_window.bin
+    # Phase 8: Behavioral module's Random Forest + linear SVM ensemble
+    # (BehavioralClassifier), trained by
+    # tools/behavioral_model/generate_and_train.py
+    - assets/ml/behavioral_classifier_model.json

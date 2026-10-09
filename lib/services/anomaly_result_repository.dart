@@ -1,4 +1,5 @@
 import '../models/anomaly_result_log_entry.dart';
+import '../models/behavioral_classification_result.dart';
 import '../services/anomaly_evaluator.dart';
 import 'feature_vault_service.dart';
 
@@ -21,15 +22,21 @@ class AnomalyResultRepository {
         .toList();
   }
 
+  /// [classification] is optional — stored alongside [result] when the
+  /// Behavioral classifier produced one, left absent otherwise (cold
+  /// start, or the classifier asset failed to load). See
+  /// AnomalyResultLogEntry's doc comment for the persisted shape.
   Future<void> save(
     AnomalyResult result, {
     required DateTime evaluatedAt,
     required String windowKey,
+    BehavioralClassificationResult? classification,
   }) async {
     final entry = AnomalyResultLogEntry(
       evaluatedAt: evaluatedAt,
       windowKey: windowKey,
       result: result,
+      classification: classification,
     );
 
     final current = loadAll()..add(entry);
