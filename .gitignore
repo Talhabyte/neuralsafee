@@ -50,7 +50,6 @@ app.*.map.json
 # ML model files (too large for git — share separately, e.g. via Drive).
 # assets/ml/neuralsafe_text_model.tflite and assets/ml/sentencepiece.bpe.model
 # must be placed here manually before building.
-/assets/ml/
 /assets/dummy_xlmr_text_model.tflite
 voice_data/
 *.wav
