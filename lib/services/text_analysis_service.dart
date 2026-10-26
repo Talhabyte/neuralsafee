@@ -4,6 +4,8 @@ import 'package:path_provider/path_provider.dart';
 import 'package:tflite_flutter/tflite_flutter.dart';
 import 'package:dart_sentencepiece_tokenizer/dart_sentencepiece_tokenizer.dart';
 
+import 'text_rules.dart';
+
 class TextAnalysisResult {
   final double score; // 0-100
   final String predictedClass;
@@ -20,8 +22,9 @@ class TextAnalysisResult {
       'TextAnalysisResult(score: $score, class: $predictedClass, probs: $probabilities)';
 }
 
-// Starter keyword lists (English + Urdu). Pragmatic placeholder set —
-// expand later with domain-specific terms if time allows.
+// LEGACY keyword lists (substring matching; no longer used for scoring).
+// Scoring now uses TextRules in text_rules.dart, which matches whole words,
+// handles negation / idioms / Roman Urdu, and detects short pleas.
 const List<String> kHighRiskWords = [
   'kill',
   'murder',
@@ -61,23 +64,6 @@ const List<String> kModerateRiskWords = [
   'دھمکی',
 ];
 
-double _maxWordScore(String text) {
-  final lower = text.toLowerCase();
-  final words = lower.split(RegExp(r'\s+'));
-  double maxScore = 0;
-  for (final w in words) {
-    final cleaned = w.replaceAll(RegExp(r'[^\p{L}\p{N}]', unicode: true), '');
-    if (cleaned.isEmpty) continue;
-    if (kHighRiskWords.any((h) => cleaned.contains(h.toLowerCase()))) {
-      if (95 > maxScore) maxScore = 95;
-    } else if (kModerateRiskWords
-        .any((m) => cleaned.contains(m.toLowerCase()))) {
-      if (70 > maxScore) maxScore = 70;
-    }
-  }
-  return maxScore;
-}
-
 /// Pure, unit-testable scoring function per FYP Chapter 4.5.2 pseudocode.
 TextAnalysisResult computeTextScore(
     String originalText, List<double> classProbs) {
@@ -98,42 +84,60 @@ TextAnalysisResult computeTextScore(
   }
   final predictedClass = classNames[maxIdx];
 
-  final maxWordScore = _maxWordScore(originalText);
-
-  double textScore;
-  if (maxWordScore > 80) {
-    textScore = 95;
-  } else {
-    double baseScore;
-    switch (predictedClass) {
-      case 'Violence':
-        baseScore = 80 + pViolence * 20;
-        break;
-      case 'Distress':
-        baseScore = 50 + pDistress * 30;
-        break;
-      case 'Help':
-        baseScore = 40 + pHelp * 40;
-        break;
-      default:
-        baseScore = pNormal * 20;
-    }
-
-    if (pViolence > 0.8 || pDistress > 0.75 || pHelp > 0.75) {
-      textScore = baseScore;
-    } else {
-      final maxRiskProb =
-          [pViolence, pDistress, pHelp].reduce((a, b) => a > b ? a : b);
-      textScore = baseScore * (maxRiskProb / 0.8);
-    }
+  // Rule layer: idioms / negation / fiction => benign; short pleas, Roman Urdu,
+  // coercive-control phrases etc. => minimum score ("floor").
+  final verdict = TextRules.evaluate(originalText);
+  if (verdict.benign && verdict.floor <= 0) {
+    return TextAnalysisResult(
+      score: 5.0,
+      predictedClass: 'Normal',
+      probabilities: classProbs,
+    );
   }
 
-  final finalScore = [maxWordScore, textScore].reduce((a, b) => a > b ? a : b);
+  double baseScore;
+  switch (predictedClass) {
+    case 'Violence':
+      baseScore = 80 + pViolence * 20;
+      break;
+    case 'Distress':
+      baseScore = 50 + pDistress * 30;
+      break;
+    case 'Help':
+      baseScore = 40 + pHelp * 40;
+      break;
+    default:
+      baseScore = pNormal * 20;
+  }
+
+  double modelScore;
+  if (pViolence > 0.8 || pDistress > 0.75 || pHelp > 0.75) {
+    modelScore = baseScore;
+  } else {
+    final maxRiskProb =
+        [pViolence, pDistress, pHelp].reduce((a, b) => a > b ? a : b);
+    modelScore = baseScore * (maxRiskProb / 0.8);
+  }
+
+  var finalScore = modelScore;
+  var finalClass = predictedClass;
+
+  // Uncertain model output (no class above 50%) with no rule firing is noise
+  // (e.g. everyday sentences the model has never seen): treat as no signal.
+  if (maxP < 0.5 && verdict.floor <= 0) {
+    finalScore = modelScore > 15 ? 15.0 : modelScore;
+    finalClass = 'Normal';
+  }
+
+  if (verdict.floor > finalScore) {
+    finalScore = verdict.floor;
+    if (verdict.cls != null) finalClass = verdict.cls!;
+  }
   final capped = finalScore > 100 ? 100.0 : finalScore;
 
   return TextAnalysisResult(
     score: capped,
-    predictedClass: predictedClass,
+    predictedClass: finalClass,
     probabilities: classProbs,
   );
 }
@@ -172,11 +176,7 @@ class TextAnalysisService {
     return rawId + 1;
   }
 
-  Future<TextAnalysisResult> analyze(String text) async {
-    if (!_initialized) {
-      await init();
-    }
-
+  Future<List<double>> _inferProbs(String text) async {
     final rawIds = _tokenizer!.encode(text).ids;
     final contentIds = rawIds.map(_toXlmrId).toList();
     var fullIds = [0, ...contentIds, 2];
@@ -201,7 +201,27 @@ class TextAnalysisService {
       {0: output},
     );
 
-    final probs = (output[0] as List).map((e) => e as double).toList();
-    return computeTextScore(text, probs);
+    return (output[0] as List).map((e) => e as double).toList();
+  }
+
+  /// Scores each sentence separately (max 12) and returns the most dangerous
+  /// one, so a dangerous line cannot be diluted by harmless text around it or
+  /// cut off by the model's 128-token limit.
+  Future<TextAnalysisResult> analyze(String text) async {
+    if (!_initialized) {
+      await init();
+    }
+
+    final segments = TextRules.splitSegments(text);
+    if (segments.isEmpty) {
+      return computeTextScore(text, await _inferProbs(text));
+    }
+
+    TextAnalysisResult? best;
+    for (final seg in segments.take(12)) {
+      final r = computeTextScore(seg, await _inferProbs(seg));
+      if (best == null || r.score > best.score) best = r;
+    }
+    return best!;
   }
 }
